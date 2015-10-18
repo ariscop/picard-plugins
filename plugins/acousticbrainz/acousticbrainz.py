@@ -43,83 +43,75 @@ ACOUSTICBRAINZ_PORT = 80
 
 REQUEST_DELAY[(ACOUSTICBRAINZ_HOST, ACOUSTICBRAINZ_PORT)] = 50
 
-def result(album, metadata, data, reply, error):
-    moods = []
-    genres = []
-    try:
-        data = json.loads(data)["highlevel"]
-        for k, v in data.items():
-            if k.startswith("genre_") and not v["value"].startswith("not_"):
-                genres.append(v["value"])
-            if k.startswith("mood_") and not v["value"].startswith("not_"):
-                moods.append(v["value"])
-
-        metadata["genre"] = genres
-        metadata["mood"] = moods
-        log.debug(u"%s: Track %s (%s) Parsed response (genres: %s, moods: %s)", PLUGIN_NAME, metadata["musicbrainz_recordingid"], metadata["title"], str(genres), str(moods))
-    except Exception as e:
-        log.error(u"%s: Track %s (%s) Error parsing response: %s", PLUGIN_NAME, metadata["musicbrainz_recordingid"], metadata["title"], str(e))
-    finally:
-        album._requests -= 1
-        album._finalize_loading(None)
-
-def process_track(album, metadata, release, track):
-    album.tagger.xmlws.download(
-        ACOUSTICBRAINZ_HOST,
-        ACOUSTICBRAINZ_PORT,
-        u"/%s/high-level" % (metadata["musicbrainz_recordingid"]),
-        partial(result, album, metadata),
-        priority=True
-    )
+def album_add_request(album):
     album._requests += 1
 
-register_track_metadata_processor(process_track)
+def album_remove_request(album):
+    album._requests -= 1
+    album._finalize_loading(None)
 
-class AcousticBrainz_Key:
+class AcousticBrainz:
+    def __init__(self, endpoint, callback):
+        self.endpoint = endpoint
+        self.callback = callback
 
-    def get_data(self, album, track_metadata, trackXmlNode, releaseXmlNode):
-        recordingId = track_metadata['musicbrainz_recordingid']
-        if recordingId:
-            log.debug("%s: Add AcusticBrainz request for %s (%s)", PLUGIN_NAME, track_metadata['title'], recordingId)
-            self.album_add_request(album)
-            path = "/%s/low-level" % recordingId
-            return album.tagger.xmlws.get(
-                        ACOUSTICBRAINZ_HOST,
-                        ACOUSTICBRAINZ_PORT,
-                        path,
-                        partial(self.process_data, album, track_metadata),
-                        xml=False, priority=True, important=False)
-        return
+    def __call__(self, album, track_metadata, trackXmlNode, releaseXmlNode):
+        album.tagger.xmlws.download(
+            ACOUSTICBRAINZ_HOST,
+            ACOUSTICBRAINZ_PORT,
+            u"/%s/%s" % (track_metadata["musicbrainz_recordingid"], self.endpoint),
+            partial(self._response, album, track_metadata),
+            priority=True
+        )
+        album_add_request(album)
 
-    def process_data(self, album, track_metadata, response, reply, error):
+    def _response(self, album, track_metadata, response, reply, error):
         if error:
-            log.error("%s: Network error retrieving acousticBrainz data for recordingId %s",
+            log.error(u"%s: Network error retrieving acousticBrainz data for recordingId %s",
                 PLUGIN_NAME, track_metadata['musicbrainz_recordingid'])
-            self.album_remove_request(album)
+            album_remove_request(album)
             return
-        data = json.loads(response)
-        if "tonal" in data:
-            if "key_key" in data["tonal"]:
-                key = data["tonal"]["key_key"]
-                if "key_scale" in data["tonal"]:
-                    scale = data["tonal"]["key_scale"]
-                    if scale == "minor":
-                        key += "m"
-                track_metadata["key"] = key
-                log.debug("%s: Track '%s' is in key %s", PLUGIN_NAME, track_metadata["title"], key)
-        if "rhythm" in data:
-            if "bpm" in data["rhythm"]:
-                bpm = int(data["rhythm"]["bpm"] + 0.5)
-                track_metadata["bpm"] = bpm
-                log.debug("%s: Track '%s' has %s bpm", PLUGIN_NAME, track_metadata["title"], bpm)
-        self.album_remove_request(album)
 
-    def album_add_request(self, album):
-        album._requests += 1
+        try:
+            response = json.loads(response)
+            self.callback(album, track_metadata, response)
+        except Exception as e:
+            log.error(u"%s: Error handling %s AcousticBrainz data for recordingId %s: %s",
+                (PLUGIN_NAME, self.endpoint, track_metadata["musicbrainz_recordingid"], str(e)))
 
-    def album_remove_request(self, album):
-        album._requests -= 1
-        if album._requests == 0:
-            album._finalize_loading(None)
+        album_remove_request(album)
 
-register_track_metadata_processor(AcousticBrainz_Key().get_data)
+
+def mood_genre(album, track_metadata, data):
+    moods = []
+    genres = []
+
+    data = data["highlevel"]
+    for k, v in data.items():
+        if k.startswith("genre_") and not v["value"].startswith("not_"):
+            genres.append(v["value"])
+        if k.startswith("mood_") and not v["value"].startswith("not_"):
+            moods.append(v["value"])
+
+    track_metadata["genre"] = genres
+    track_metadata["mood"] = moods
+
+register_track_metadata_processor(AcousticBrainz("high-level", mood_genre))
+
+def tonal_rhythm(album, track_metadata, data):
+    if "tonal" in data:
+        if "key_key" in data["tonal"]:
+            key = data["tonal"]["key_key"]
+            if "key_scale" in data["tonal"]:
+                scale = data["tonal"]["key_scale"]
+                if scale == "minor":
+                    key += "m"
+            track_metadata["key"] = key
+            log.debug(u"%s: Track '%s' is in key %s", PLUGIN_NAME, track_metadata["title"], key)
+    if "rhythm" in data:
+        if "bpm" in data["rhythm"]:
+            bpm = int(data["rhythm"]["bpm"] + 0.5)
+            track_metadata["bpm"] = bpm
+            log.debug(u"%s: Track '%s' has %s bpm", PLUGIN_NAME, track_metadata["title"], bpm)
+
+register_track_metadata_processor(AcousticBrainz("low-level", tonal_rhythm))
